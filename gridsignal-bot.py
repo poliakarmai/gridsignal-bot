@@ -4,14 +4,14 @@ GridSignal Bot v4.0 — Telegram-бот сигналов Bollinger Grid.
 Фичи: /scan, /scan short, /rules, /help, /stats, /setrisk, /history, /subscribe, /alert, /chart
 v4.0: SHORT-сигналы, Multi-TF (D/5/3/W/M), RSI(14), батчевый check_outcomes, /lang en/ru
 
-Бесплатная версия: до 10 /scan в сутки на пользователя.
+Бесплатная версия: до 2 /scan в сутки на пользователя.
 """
 
-import os, sys, json, time, asyncio, re, sqlite3, subprocess, threading, urllib.parse, urllib.request, urllib.error
+import os, sys, json, time, asyncio, re, sqlite3, subprocess, urllib.parse, urllib.request, urllib.error
 from datetime import datetime, timezone
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, InlineQueryHandler, CallbackQueryHandler, PreCheckoutQueryHandler
-from telegram import InlineQueryResultArticle, InputTextMessageContent
+from telegram import InlineQueryResultArticle, InputTextMessageContent, InlineQueryResultsButton
 
 SCANNER_SCRIPT = os.path.expanduser('~/.local/bin/gridsignal_scanner.py')
 DB_PATH = os.path.expanduser('~/.local/share/gridsignal-bot/users.db')
@@ -30,25 +30,38 @@ def _load_rpc_token():
         row = db.execute("SELECT value FROM kv_store WHERE key='rpc_auth_token'").fetchone()
         if row:
             RPC_TOKEN = row[0]
-            print(f"[GridSignal] RPC token loaded")
+            print("[GridSignal] ✅ RPC token loaded — using direct RPC (fast)")
         else:
-            print("[GridSignal] WARNING: RPC token not found in state.db")
+            print("[GridSignal] ⚠️ RPC token NOT FOUND in state.db — scans will fall back to CLI (slow)")
     except Exception as e:
-        print(f"[GridSignal] RPC token load error: {e}")
+        print(f"[GridSignal] ❌ RPC token load FAILED: {e} — scans will use CLI fallback (slow, may break)")
 
 
 BOT_VERSION = "5.0"
 
 # Pro subscription
 PRO_PRICE_STARS = 300  # ~400 ₽
-PRO_CHANNEL_ID = os.environ.get("GRIDSIGNAL_PRO_CHANNEL", "")
 PAYMENTS_DB = os.path.expanduser("~/.local/share/gridsignal-bot/pro_users.db")
 TON_PRICE = 2.0  # TON
 CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN", "")
+# M8: remove from process environ to prevent leak via /proc/PID/environ
+os.environ.pop("CRYPTOBOT_TOKEN", None)
 TON_INVOICES_DB = os.path.expanduser("~/.local/share/gridsignal-bot/ton_invoices.db")
+GRIDSIGNAL_ADMIN_ID = int(os.environ.get("GRIDSIGNAL_ADMIN_ID", "319665243"))
+GRIDSIGNAL_ADMIN_NOTIFY_CHAT = int(os.environ.get("GRIDSIGNAL_ADMIN_NOTIFY_CHAT", "5529208670"))
+
+def _now() -> str:
+    """Единый формат даты: SQLite-совместимый (без 'T')."""
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+def _expires(days: int = 30) -> str:
+    """Дата истечения через N дней."""
+    from datetime import timedelta
+    return (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
 
 def init_ton_db():
-    conn = sqlite3.connect(TON_INVOICES_DB)
+    conn = sqlite3.connect(TON_INVOICES_DB, check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL')
     conn.execute("""CREATE TABLE IF NOT EXISTS ton_invoices (
         invoice_id INTEGER PRIMARY KEY, user_id INTEGER,
         status TEXT DEFAULT 'pending', created_at TEXT)""")
@@ -78,7 +91,7 @@ async def create_ton_invoice(user_id: int):
             inv = data["result"]
             conn = init_ton_db()
             conn.execute("INSERT OR REPLACE INTO ton_invoices VALUES (?,?,?,?)",
-                         (inv["invoice_id"], user_id, "pending", datetime.now().isoformat()))
+                         (inv["invoice_id"], user_id, "pending", _now()))
             conn.commit()
             conn.close()
             return inv["bot_invoice_url"], inv["invoice_id"]
@@ -111,12 +124,26 @@ async def check_ton_payment(invoice_id: int) -> bool:
     return False
 
 def init_pro_db():
-    conn = sqlite3.connect(PAYMENTS_DB)
+    conn = sqlite3.connect(PAYMENTS_DB, check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL')
     conn.execute("""CREATE TABLE IF NOT EXISTS pro_users (
         user_id INTEGER PRIMARY KEY, username TEXT, paid_at TEXT,
-        expires_at TEXT, active INTEGER DEFAULT 1)""")
+        expires_at TEXT, active INTEGER DEFAULT 1, charge_id TEXT)""")
+    try:
+        conn.execute("ALTER TABLE pro_users ADD COLUMN charge_id TEXT")
+    except sqlite3.OperationalError:
+        pass  # колонка уже есть
     conn.commit()
     return conn
+
+def activate_pro(user_id: int, username: str, charge_id: str = "") -> None:
+    """Активировать Pro-подписку на 30 дней."""
+    conn = init_pro_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO pro_users (user_id,username,paid_at,expires_at,active,charge_id) VALUES (?,?,?,?,1,?)",
+        (user_id, username, _now(), _expires(30), charge_id))
+    conn.commit()
+    conn.close()
 
 def is_pro(user_id: int) -> bool:
     conn = init_pro_db()
@@ -137,8 +164,9 @@ def _escape_mdv2(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 SCAN_COOLDOWN = 60
-MAX_SCANS_PER_DAY = 3
+MAX_SCANS_PER_DAY = 2
 MAX_ALERTS_PER_USER = 5
+_ton_cooldown = {}  # user_id → last check timestamp (rate limit)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -271,11 +299,11 @@ def reset_daily_counts(conn):
 async def _reset_counts_job():
     """Job queue wrapper: открыть коннект, сбросить, закрыть."""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         reset_daily_counts(conn)
         conn.close()
-    except Exception:
-        pass  # тихо, не ронять бота
+    except Exception as e:
+        print(f"[GridSignal] _reset_counts_job failed: {e}")
 
 
 def save_signals(signals: list, user_id: int = None, timeframe: str = 'D', mode: str = 'long'):
@@ -338,22 +366,109 @@ async def get_cached_scan(interval: str = 'D', user_id: int = None, symbol: str 
             _cache[f'{cache_key}_ts'] = now
             save_signals(data, user_id, interval, mode)
 
+        # Не выходим сразу: при сбое RPC (500 на холодном кеше — таймаут as_completed(30s)
+        # в bybit-ws rpc.py) фильтр ниже отдаст пустой список, и для запроса по тикеру
+        # сработает локальный расчёт. Раньше `return []` съедал этот путь и юзер получал
+        # «Не удалось получить данные» вместо данных (баг 16.10.2026).
         except urllib.error.HTTPError as e:
             print(f'[GridSignal] RPC HTTP {e.code}: {e.reason}')
-            return []
+            data = []
         except json.JSONDecodeError as e:
             print(f'[GridSignal] JSON parse error: {e}')
-            return []
+            data = []
         except Exception as e:
             print(f'[GridSignal] Scan error: {type(e).__name__}: {e}')
-            return []
+            data = []
 
     # Фильтры
     if symbol:
         data = [s for s in data if s['symbol'] == symbol]
+        if not data:
+            # Тикера нет в глобальном топе RPC-скана → считаем его отдельно.
+            # ponytail: per-symbol считаем в потоке, кеша нет — скан по тикеру редкий
+            # (лимит 2/день), а RPC-кеш топ-5 не переиспользуется.
+            one = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: fetch_symbol_signal(symbol, interval, mode))
+            if one:
+                data = [one]
+                if user_id:
+                    save_signals(data, user_id, interval, mode)
     if green_only:
         data = [s for s in data if s.get('bb_pos', 100) < 25 or s.get('bb_pct', 100) < 25]
     return data
+
+
+
+def _bb_from_closes(closes: list, n: int = 20) -> dict:
+    """BB(20,2) + RSI(14) + down_days. Sample std (n-1) — как в RPC-сканере,
+    чтобы цифры в боте совпадали с остальными сигналами."""
+    import math
+    if len(closes) < n + 1:
+        return {}
+    window = closes[-n:]
+    sma = sum(window) / n
+    var = sum((c - sma) ** 2 for c in window) / (n - 1)
+    std = math.sqrt(var)
+    upper, lower = sma + 2 * std, sma - 2 * std
+    bb_pct = (closes[-1] - lower) / (upper - lower) * 100 if upper != lower else 50.0
+    w = closes[-15:]
+    gains = sum(max(w[i] - w[i - 1], 0) for i in range(1, len(w)))
+    losses = sum(max(w[i - 1] - w[i], 0) for i in range(1, len(w)))
+    rsi = 100 - (100 / (1 + gains / max(losses, 0.0001)))
+    down_days = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] < closes[i - 1]:
+            down_days += 1
+        else:
+            break
+    return {'sma': sma, 'upper': upper, 'lower': lower, 'bb_pct': round(bb_pct, 1),
+            'rsi': round(rsi), 'down_days': down_days}
+
+
+def fetch_symbol_signal(symbol: str, interval: str = 'D', mode: str = 'long') -> dict | None:
+    """Сигнал по ОДНОМУ тикеру — через CLI kline.
+
+    Зачем: RPC `/scan` сканирует только топ-50 по обороту и параметра symbol не
+    принимает, поэтому раньше бот фильтровал глобальный топ-5 — и любой тикер не из
+    топ-5 отдавал «Не удалось получить данные» (баг 16.10.2026). Тут считаем сами.
+    """
+    tf = {'5m': '5', '3m': '3', 'D': 'D', 'W': 'W'}.get(interval, 'D')
+    try:
+        r = subprocess.run(
+            [BYBIT_CLI, 'raw', 'GET',
+             f'/v5/market/kline?category=linear&symbol={symbol}&interval={tf}&limit=100'],
+            capture_output=True, text=True, timeout=25)
+        data = json.loads(r.stdout)
+        if data.get('retCode') != 0:
+            return None
+        rows = list(reversed(data['result']['list']))
+        closes = [float(x[4]) for x in rows]
+        bb = _bb_from_closes(closes)
+        if not bb:
+            return None
+
+        turnover = 0.0
+        r2 = subprocess.run(
+            [BYBIT_CLI, 'raw', 'GET',
+             f'/v5/market/tickers?category=linear&symbol={symbol}'],
+            capture_output=True, text=True, timeout=15)
+        d2 = json.loads(r2.stdout)
+        if d2.get('retCode') == 0:
+            lst = (d2.get('result') or {}).get('list') or [{}]
+            turnover = float(lst[0].get('turnover24h') or 0)
+
+        pct = bb['bb_pct']
+        score = round(min(10.0, max(0.0, (35 - pct) * 0.4)) if mode == 'long'
+                      else min(10.0, max(0.0, (pct - 65) * 0.4)), 1)
+        return {
+            'symbol': symbol, 'side': 'Buy' if mode == 'long' else 'Sell', 'score': score,
+            'price': closes[-1], 'bb_pct': pct, 'bb_pos': pct,
+            'lower_bb': bb['lower'], 'upper_bb': bb['upper'], 'middle_bb': bb['sma'],
+            'down_days': bb['down_days'], 'turnover': turnover, 'rsi': bb['rsi'], 'mode': mode,
+        }
+    except Exception as e:
+        print(f'[GridSignal] fetch_symbol_signal({symbol}) failed: {type(e).__name__}: {e}')
+        return None
 
 
 
@@ -402,7 +517,7 @@ T = {
             f"🌐 `/lang ru` — Русская версия\n"
             f"📊 `/stats` — статистика и винрейт\n"
             f"📐 `/rules` — стратегия\n\n"
-            "⚡ Бесплатно: до 3 сканов в сутки.\n\n"
+            "⚡ Бесплатно: до 2 сканов в сутки.\n\n"
             "💰 **Реферальная ссылка Bybit:**\n"
             "`https://www.bybit.com/invite?ref=DQ0EAQ`\n\n"
             "⚠️ **Дисклеймер:** Бот даёт торговые сигналы на основе Bollinger Bands. Это не финансовая рекомендация. "
@@ -410,7 +525,7 @@ T = {
             "Всегда тестируйте стратегию на тестнете Bybit перед реальной торговлей. "
             "Автор не несёт ответственности за ваши торговые решения."
         ),
-        'scan_limit': '📊 Лимит на сегодня исчерпан (10 сканов). Завтра будет снова.',
+        'scan_limit': '📊 Лимит на сегодня исчерпан (2 скана). Завтра будет снова.',
         'scan_cooldown': '⏳ Следующий скан через {} сек',
         'scanning': '🔍 Сканирую рынок...',
         'scan_header': '🚀 **GRID SIGNALS**',
@@ -453,7 +568,7 @@ T = {
     'en': {
         'lang_set': '🇬🇧 Language: **English**',
         'start': (
-            "🚀 **GridSignal Bot v4.0**\n\n"
+            f"🚀 **GridSignal Bot v{BOT_VERSION}**\n\n"
             "Bollinger Grid signals: Bollinger Bands + 8-metric scoring + RSI.\n\n"
             "📊 `/scan` — top-5 LONG signals\n"
             "🔴 `/scan short` — top-5 SHORT signals\n"
@@ -466,14 +581,14 @@ T = {
             "🌐 `/lang ru` — Русская версия\n"
             "📐 `/rules` — strategy rules\n"
             "📊 `/stats` — statistics\n\n"
-            "⚡ Free: up to 10 scans/day.\n\n"
+            "⚡ Free: up to 2 scans/day.\n\n"
             "💰 Trade on Bybit: [bybit.com/invite?ref=DQ0EAQ](https://www.bybit.com/invite?ref=DQ0EAQ&medium=referral&utm_campaign=evergreen)\n\n"
             "⚠️ **Disclaimer:** This bot provides trading signals based on Bollinger Bands. This is not financial advice. "
             "Futures trading with leverage (up to 10x) carries high risk — you can lose your entire deposit. "
             "Always test your strategy on Bybit testnet before trading real funds. "
             "The author is not responsible for your trading decisions."
         ),
-        'scan_limit': '📊 Daily limit reached (10 scans). Come back tomorrow.',
+        'scan_limit': '📊 Daily limit reached (2 scans). Come back tomorrow.',
         'scan_cooldown': '⏳ Next scan in {} sec',
         'scanning': '🔍 Scanning market...',
         'scan_header': '🚀 **GRID SIGNALS**',
@@ -1049,12 +1164,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет активной подписки.\n⭐ /subscribe — купить Pro")
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Авто-подтверждение платежа."""
+    """Проверка платежа: только grid signal pro."""
     query = update.pre_checkout_query
+    if query.invoice_payload != "gridsignal_pro_30d":
+        await query.answer(ok=False, error_message="Unknown product")
+        return
     await query.answer(ok=True)
 
 async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Активация Pro после оплаты."""
+    """Активация Pro после оплаты Stars."""
     user_id = update.effective_user.id
     username = update.effective_user.username or str(user_id)
     payload = update.message.successful_payment.invoice_payload
@@ -1062,17 +1180,17 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if payload != "gridsignal_pro_30d":
         return
 
-    from datetime import timedelta
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(days=30)).isoformat()
-
+    # Idempotency: skip already-processed payments (scout audit fix #3)
+    charge_id = update.message.successful_payment.telegram_payment_charge_id
     conn = init_pro_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO pro_users (user_id,username,paid_at,expires_at,active) VALUES (?,?,?,?,1)",
-        (user_id, username, now, expires)
-    )
-    conn.commit()
+    existing = conn.execute(
+        "SELECT 1 FROM pro_users WHERE user_id=? AND charge_id=?", (user_id, charge_id)
+    ).fetchone()
     conn.close()
+    if existing:
+        return  # duplicate callback — already processed
+
+    activate_pro(user_id, username, charge_id)
 
     await update.message.reply_text(
         "🎉 **GridSignal Pro активирован!**\n"
@@ -1085,7 +1203,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     # Notify admin
     try:
         await context.bot.send_message(
-            chat_id=5529208670,
+            chat_id=GRIDSIGNAL_ADMIN_NOTIFY_CHAT,
             text=f"🎉 Новый GridSignal Pro!\n@{username} ({user_id})\n⭐ {PRO_PRICE_STARS} Stars"
         )
     except Exception:
@@ -1132,19 +1250,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_status(update, context)
     elif data.startswith("check_ton_"):
         invoice_id = int(data.split("_")[-1])
+
+        # Rate limit: не чаще 10 сек между проверками TON на пользователя
+        now_ts = time.time()
+        last = _ton_cooldown.get(query.from_user.id, 0)
+        if now_ts - last < 10:
+            await query.answer("⏳ Подождите 10 сек между проверками", show_alert=False)
+            return
+        _ton_cooldown[query.from_user.id] = now_ts
+
         await query.message.reply_text("⏳ Проверяю платёж...")
+
+        # Проверить что инвойс принадлежит этому пользователю
+        ton_conn = init_ton_db()
+        inv_row = ton_conn.execute(
+            "SELECT user_id FROM ton_invoices WHERE invoice_id=?", (invoice_id,)).fetchone()
+        ton_conn.close()
+        if not inv_row or inv_row[0] != query.from_user.id:
+            await query.message.reply_text("❌ Этот счёт не ваш.")
+            return
+
         if await check_ton_payment(invoice_id):
-            # Activate Pro
-            from datetime import timedelta
-            now = datetime.now().isoformat()
-            expires = (datetime.now() + timedelta(days=30)).isoformat()
-            conn = init_pro_db()
-            conn.execute(
-                "INSERT OR REPLACE INTO pro_users (user_id,username,paid_at,expires_at,active) VALUES (?,?,?,?,1)",
-                (query.from_user.id, query.from_user.username or str(query.from_user.id), now, expires)
-            )
-            conn.commit()
-            conn.close()
+            activate_pro(query.from_user.id,
+                        query.from_user.username or str(query.from_user.id))
             await query.message.reply_text(
                 "🎉 **TON-платёж получен! GridSignal Pro активирован!**\n\n"
                 "/scan — безлимитные сканы\n/status — статус подписки"
@@ -1156,7 +1284,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def deprovision_expired(context: ContextTypes.DEFAULT_TYPE):
     """Деактивировать истекшие Pro-подписки."""
     conn = init_pro_db()
-    now = datetime.now().isoformat()
+    now = _now()
     expired = conn.execute(
         "SELECT user_id FROM pro_users WHERE active=1 AND expires_at < ?", (now,)
     ).fetchall()
@@ -1451,8 +1579,21 @@ print(f"{{price}}\\n{{lower}}\\n{{pos}}")
 # ══ #1 Inline ══
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик inline-запросов: @Gridbolbot BTCUSDT"""
+    """Обработчик inline-запросов: @Gridbolbot BTCUSDT — только для Pro."""
     query = update.inline_query.query.strip().upper()
+    user_id = update.effective_user.id
+
+    # Gate: Pro-only (scout audit fix #1)
+    if not is_pro(user_id):
+        await update.inline_query.answer(
+            [], cache_time=300,
+            button=InlineQueryResultsButton(
+                text="🔒 Pro only",
+                start_parameter="pro_required"
+            )
+        )
+        return
+
     if not query:
         await update.inline_query.answer([], cache_time=10)
         return
@@ -1547,7 +1688,7 @@ async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_fear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Индекс страха на основе BB позиций топ-10 монет."""
-    import random, subprocess, json, re
+    import subprocess, json, re
 
     await update.message.reply_text("😱 Сканирую настроение рынка...")
     conn_tmp = init_db(); log_event(conn_tmp, update.effective_user.id, 'fear', update); conn_tmp.close()
@@ -1827,7 +1968,7 @@ async def cmd_horoscope(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    is_admin = user_id == 319665243
+    is_admin = user_id == GRIDSIGNAL_ADMIN_ID
     conn = init_db()
     lang = get_lang(conn, user_id)
 
@@ -2022,7 +2163,12 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t('chart_usage', lang))
         return
 
-    symbol = args[0].upper()
+    symbol = args[0].upper().strip()
+    # Validate: only alphanumeric, 4-12 chars (USDT suffix optional)
+    symbol_clean = symbol.replace('USDT', '') if symbol.endswith('USDT') else symbol
+    if not re.match(r'^[A-Z0-9]{2,12}$', symbol_clean):
+        await update.message.reply_text(f'❌ Invalid symbol: {symbol}')
+        return
     if not symbol.endswith('USDT'):
         symbol += 'USDT'
 
@@ -2126,7 +2272,11 @@ async def cmd_chart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn2.close()
 
     except Exception as e:
-        await status_msg.edit_text(t('chart_error', lang, str(e)[:200]))
+        err_msg = str(e)
+        # Sanitize: убираем системные пути из сообщений об ошибках
+        err_msg = re.sub(r'/home/\S+', '[path]', err_msg)
+        err_msg = re.sub(r'/tmp/\S+', '[tmp]', err_msg)
+        await status_msg.edit_text(t('chart_error', lang, err_msg[:200]))
 
 
 # ══ Обработчик инлайн-кнопок (язык) ══
@@ -2221,6 +2371,8 @@ async def handle_dex_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return  # стикер, фото, edit — игнорируем
     text = update.message.text
 
     # DEX-режим: пользователь вводит тикер после нажатия 🔍 DEX
@@ -2463,6 +2615,27 @@ def main():
 
     # Проверка исходов сигналов: раз в час
     app.job_queue.run_repeating(check_outcomes, interval=3600, first=60)
+
+    # Глобальный обработчик ошибок — сетевые сбои Telegram API не роняют бот в стэк
+    async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        import traceback
+        import httpx
+        from telegram.error import NetworkError, TimedOut
+        err = context.error
+        transient = (
+            NetworkError, TimedOut,
+            httpx.ReadError, httpx.ConnectError, httpx.ConnectTimeout,
+            httpx.ReadTimeout, httpx.WriteError, httpx.WriteTimeout,
+            httpx.PoolTimeout, httpx.RemoteProtocolError,
+            ConnectionError, TimeoutError,
+        )
+        if isinstance(err, transient):
+            print(f"[GridSignal] ⚠️ сетевой сбой (transient, игнор): {type(err).__name__}", flush=True)
+            return
+        tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
+        print(f"[GridSignal] ❌ ошибка update: {err}\n{tb}", flush=True)
+
+    app.add_error_handler(_error_handler)
 
     print(f"🤖 GridSignal Bot v{BOT_VERSION} запущен...")
     app.run_polling()
