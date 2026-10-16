@@ -336,7 +336,7 @@ async def get_cached_scan(interval: str = 'D', user_id: int = None, symbol: str 
                      green_only: bool = False, mode: str = 'long') -> list:
     """Получить сигналы через RPC /scan (WS-кеш, без CLI)."""
     global _cache
-    cache_key = f'data_{interval}_{mode}'
+    cache_key = f'data_{interval}_{mode}_{symbol or "all"}'
     now = time.time()
     if cache_key in _cache and (now - _cache.get(f'{cache_key}_ts', 0)) < CACHE_TTL:
         data = _cache[cache_key]
@@ -348,7 +348,10 @@ async def get_cached_scan(interval: str = 'D', user_id: int = None, symbol: str 
                 print('[GridSignal] No RPC token — scan unavailable')
                 return []
 
-            body = json.dumps({"mode": mode, "interval": interval, "limit": 5}).encode()
+            payload = {"mode": mode, "interval": interval, "limit": 5}
+            if symbol:
+                payload["symbols"] = [symbol]   # RPC /scan: скан конкретного тикера
+            body = json.dumps(payload).encode()
             req = urllib.request.Request(
                 RPC_URL, data=body,
                 headers={
